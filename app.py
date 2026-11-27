@@ -56,7 +56,7 @@ load_dotenv()
 
 APP_NAME = "KnowMate AI"
 APP_TAGLINE = "Your intelligent knowledge workspace"
-APP_VERSION = "2.0"
+APP_VERSION = "2.1"
 
 st.set_page_config(
     page_title=f"{APP_NAME} | Knowledge Workspace",
@@ -161,10 +161,20 @@ def create_conversation() -> str:
 
 
 def save_current_conversation() -> None:
+    messages = st.session_state.get("messages", [])
+    if not any(m.get("role") == "user" and str(m.get("content", "")).strip() for m in messages):
+        return
     conversation_id = st.session_state.get("active_conversation_id")
     if not conversation_id:
-        conversation_id = create_conversation()
-    messages = st.session_state.get("messages", [])
+        conversation_id = uuid.uuid4().hex
+        st.session_state.active_conversation_id = conversation_id
+        now = datetime.now().isoformat(timespec="seconds")
+        with get_db_connection() as connection:
+            connection.execute(
+                "INSERT INTO conversations (id, title, messages, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+                (conversation_id, "New conversation", "[]", now, now),
+            )
+            connection.commit()
     first_user = next(
         (m.get("content", "") for m in messages if m.get("role") == "user"),
         "New conversation",
@@ -206,15 +216,45 @@ def delete_conversation(conversation_id: str) -> None:
         connection.execute("DELETE FROM conversations WHERE id = ?", (conversation_id,))
         connection.commit()
     if st.session_state.get("active_conversation_id") == conversation_id:
-        create_conversation()
+        st.session_state.active_conversation_id = None
+        st.session_state.messages = []
+        st.session_state.pending_question = ""
+
+
+def delete_all_conversations() -> None:
+    with get_db_connection() as connection:
+        connection.execute("DELETE FROM conversations")
+        connection.commit()
+    st.session_state.active_conversation_id = None
+    st.session_state.messages = []
+    st.session_state.pending_question = ""
+
+
+def conversation_date_label(value: str) -> str:
+    try:
+        date_value = datetime.fromisoformat(value).date()
+    except (TypeError, ValueError):
+        return "Earlier"
+    today = datetime.now().date()
+    if date_value == today:
+        return "Today"
+    if (today - date_value).days == 1:
+        return "Yesterday"
+    if date_value.year == today.year:
+        return date_value.strftime("%B %d")
+    return date_value.strftime("%B %d, %Y")
 
 
 initialize_session_state()
 initialize_chat_database()
-if not st.session_state.get("active_conversation_id"):
-    create_conversation()
+# Start with an empty in-memory chat. A database row is created only when the
+# user sends the first message, so the history never fills with blank chats.
 if not st.session_state.get("history_loaded"):
-    load_conversation(st.session_state.active_conversation_id)
+    active_id = st.session_state.get("active_conversation_id")
+    if active_id:
+        load_conversation(active_id)
+    else:
+        st.session_state.messages = []
     st.session_state.history_loaded = True
 
 
@@ -1258,7 +1298,8 @@ def clear_workspace() -> None:
     st.session_state.session_id = uuid.uuid4().hex[:12]
     st.session_state.last_processed_at = None
     st.session_state.pending_question = ""
-    create_conversation()
+    st.session_state.active_conversation_id = None
+    st.session_state.messages = []
     st.rerun()
 
 
@@ -1424,7 +1465,8 @@ def process_uploaded_documents(uploaded_files: list[Any] | None) -> None:
 
             st.session_state.vector_store = store
             st.session_state.document_names = list(dict.fromkeys(names))
-            create_conversation()
+            st.session_state.active_conversation_id = None
+            st.session_state.messages = []
             st.session_state.summary = ""
             st.session_state.quiz = ""
             st.session_state.last_processed_at = datetime.now().strftime("%d %b %Y, %I:%M %p")
@@ -1486,6 +1528,33 @@ def render_dashboard() -> None:
         render_stat_card("⚡", "Knowledge base", ready_label)
 
     st.write("")
+    st.markdown('<div class="km-section-heading">Start with your documents</div>', unsafe_allow_html=True)
+    upload_col, upload_info_col = st.columns([1.25, 1], gap="large")
+    with upload_col:
+        dashboard_files = st.file_uploader(
+            "Upload PDF, DOCX or TXT files",
+            type=SUPPORTED_TYPES,
+            accept_multiple_files=True,
+            key="dashboard_document_uploader",
+            help="Choose one or more study notes, textbooks or documents.",
+        )
+        if st.button(
+            "⚡ Upload and process documents",
+            type="primary",
+            use_container_width=True,
+            disabled=not dashboard_files,
+            key="dashboard_process_documents",
+        ):
+            process_uploaded_documents(dashboard_files)
+    with upload_info_col:
+        render_feature_card(
+            "📚",
+            "Your documents become searchable",
+            "After processing, ask questions, get source-grounded answers, create quick summaries and practise with quizzes. Supported: PDF, DOCX and TXT.",
+        )
+        st.caption("Tip: You can also upload files anytime from the sidebar or My Documents page.")
+
+    st.write("")
     left, right = st.columns([1.35, 1], gap="large")
 
     with left:
@@ -1516,17 +1585,32 @@ def render_dashboard() -> None:
             render_feature_card(
                 "✧",
                 "Smart Summary",
-                "Create a concise overview of the indexed document context.",
+                "Turn lengthy notes into key points, concepts and a quick revision overview.",
             )
+            if st.button("Create a summary →", use_container_width=True, key="dashboard_summary_action"):
+                navigate("AI Tools")
         with tools_cols[1]:
             render_feature_card(
                 "⌁",
                 "Knowledge Quiz",
-                "Generate practice questions from your document context.",
+                "Generate multiple-choice practice questions from your uploaded material.",
             )
+            if st.button("Start a quiz →", use_container_width=True, key="dashboard_quiz_action"):
+                navigate("AI Tools")
 
-        if st.button("Explore AI productivity tools →", use_container_width=True):
-            navigate("AI Tools")
+        st.markdown('<div class="km-section-heading" style="margin-top:20px;">How KnowMate helps you</div>', unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="km-card-copy" style="font-size:13px; line-height:1.9;">
+                <b>1. Upload</b> your PDF, DOCX or TXT study material.<br>
+                <b>2. Ask</b> questions and get answers from your own documents.<br>
+                <b>3. Summarize</b> important concepts for faster revision.<br>
+                <b>4. Practise</b> with AI-generated knowledge quizzes.<br>
+                <b>5. Revisit</b> saved chats from your date-wise history.
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     with right:
         st.markdown('<div class="km-section-heading">Recent documents</div>', unsafe_allow_html=True)
@@ -1539,7 +1623,7 @@ def render_dashboard() -> None:
             render_empty_state(
                 "📂",
                 "Your library is empty",
-                "Upload a PDF, DOCX or TXT file from the sidebar to start building your knowledge base.",
+                "Upload a PDF, DOCX or TXT file using the dashboard upload area or sidebar to start building your knowledge base.",
             )
 
         st.markdown('<div class="km-section-heading" style="margin-top:22px;">Workspace activity</div>', unsafe_allow_html=True)
@@ -1631,40 +1715,71 @@ def render_chat_page(api_key: str, model_name: str) -> None:
     history_col, chat_col = st.columns([1.05, 3.2], gap="large")
 
     with history_col:
-        st.markdown('<div class="km-section-heading">Your conversations</div>', unsafe_allow_html=True)
-        if st.button("＋ New conversation", type="primary", use_container_width=True, key="new_chat_button"):
-            create_conversation()
+        st.markdown('<div class="km-section-heading">Chat history</div>', unsafe_allow_html=True)
+        if st.button("＋ New chat", type="primary", use_container_width=True, key="new_chat_button"):
+            st.session_state.active_conversation_id = None
+            st.session_state.messages = []
+            st.session_state.pending_question = ""
             st.rerun()
 
-        conversations = get_conversations()
+        conversations = [row for row in get_conversations() if (row["messages"] or "[]") != "[]"]
+        history_query = st.text_input(
+            "Search chats",
+            placeholder="Find a conversation...",
+            key="chat_history_search",
+            label_visibility="collapsed",
+        ).strip().lower()
+        if history_query:
+            conversations = [
+                row for row in conversations
+                if history_query in (row["title"] or "").lower()
+                or history_query in (row["messages"] or "").lower()
+            ]
         if not conversations:
-            st.caption("Your saved conversations will appear here.")
-        for row in conversations:
-            active = row["id"] == st.session_state.active_conversation_id
-            label = ("● " if active else "　") + (row["title"] or "New conversation")
-            preview = ""
-            try:
-                history_messages = json.loads(row["messages"] or "[]")
-                preview = next(
-                    (m.get("content", "") for m in reversed(history_messages) if m.get("role") == "user"),
-                    "",
-                )
-            except (TypeError, json.JSONDecodeError):
-                pass
-            with st.container(border=True):
-                if st.button(
-                    label[:58],
-                    key=f"open_conversation_{row['id']}",
-                    use_container_width=True,
-                    type="primary" if active else "secondary",
-                    help=preview[:180] or "Open this conversation",
-                ):
-                    load_conversation(row["id"])
-                    st.rerun()
-                st.caption(datetime.fromisoformat(row["updated_at"]).strftime("%d %b · %I:%M %p"))
-                if st.button("Delete", key=f"delete_conversation_{row['id']}", use_container_width=True):
-                    delete_conversation(row["id"])
-                    st.rerun()
+            st.caption("No matching chats yet. Your conversations will appear here after your first question.")
+        else:
+            grouped = {}
+            for row in conversations:
+                grouped.setdefault(conversation_date_label(row["updated_at"]), []).append(row)
+
+            for date_label, rows in grouped.items():
+                st.markdown(f'<div class="km-eyebrow" style="margin-top:14px;">{safe_text(date_label)}</div>', unsafe_allow_html=True)
+                for row in rows:
+                    active = row["id"] == st.session_state.active_conversation_id
+                    try:
+                        history_messages = json.loads(row["messages"] or "[]")
+                    except (TypeError, json.JSONDecodeError):
+                        history_messages = []
+                    preview = next(
+                        (str(m.get("content", "")) for m in reversed(history_messages) if m.get("role") == "user"),
+                        "Open this conversation",
+                    )
+                    item_col, menu_col = st.columns([5, 1])
+                    with item_col:
+                        if st.button(
+                            ("● " if active else "") + (row["title"] or "New conversation")[:42],
+                            key=f"open_conversation_{row['id']}",
+                            use_container_width=True,
+                            type="primary" if active else "secondary",
+                            help=preview[:180],
+                        ):
+                            load_conversation(row["id"])
+                            st.rerun()
+                    with menu_col:
+                        with st.popover("⋯", use_container_width=True):
+                            st.caption(datetime.fromisoformat(row["updated_at"]).strftime("%d %b · %I:%M %p"))
+                            rename_key = f"rename_value_{row['id']}"
+                            st.text_input("Rename chat", value=row["title"], key=rename_key)
+                            if st.button("Save name", key=f"rename_save_{row['id']}", use_container_width=True):
+                                new_title = st.session_state.get(rename_key, "").strip()[:60]
+                                if new_title:
+                                    with get_db_connection() as connection:
+                                        connection.execute("UPDATE conversations SET title = ? WHERE id = ?", (new_title, row["id"]))
+                                        connection.commit()
+                                    st.rerun()
+                            if st.button("Delete chat", key=f"delete_conversation_{row['id']}", use_container_width=True):
+                                delete_conversation(row["id"])
+                                st.rerun()
 
     with chat_col:
         chat_header_left, chat_header_right = st.columns([3, 1])
@@ -1943,6 +2058,16 @@ def render_settings_page() -> None:
         on_change=_sync_settings_model,
     )
     st.caption("The selected model is shared with the sidebar and used for new AI responses.")
+
+    st.markdown("---")
+    st.markdown('<div class="km-section-heading">Chat history</div>', unsafe_allow_html=True)
+    saved_chats = [row for row in get_conversations() if (row["messages"] or "[]") != "[]"]
+    st.caption(f"{len(saved_chats)} saved conversation(s). You can rename or delete an individual chat from the ⋯ menu in AI Chat.")
+    confirm_delete_history = st.checkbox("I understand this permanently deletes all saved conversations.", key="confirm_delete_all_history")
+    if st.button("Delete all chat history", disabled=not confirm_delete_history, key="delete_all_history_button"):
+        delete_all_conversations()
+        st.success("All saved conversations deleted.")
+        st.rerun()
 
     st.markdown("---")
     st.markdown('<div class="km-section-heading">Session details</div>', unsafe_allow_html=True)
